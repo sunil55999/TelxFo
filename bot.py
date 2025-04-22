@@ -25,8 +25,8 @@ import os
 import random
 
 # Configuration
-API_ID = 28507153  # Replace with your API ID
-API_HASH = "68391d8f84e503d36bc49f0215148b67"  # Replace with your API hash
+API_ID = 23617139  # Replace with your API ID
+API_HASH = "5bfc582b080fa09a1a2eaa6ee60fd5d4"  # Replace with your API hash
 SESSION_FILE = "userbot_session"
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
