@@ -32,16 +32,19 @@ client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 MAPPINGS_FILE = "channel_mappings.json"
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
+RETRY_DELAY = 15  # seconds
 MAX_QUEUE_SIZE = 100
 MAX_MAPPING_HISTORY = 1000
 MONITOR_CHAT_ID = None
 NOTIFY_CHAT_ID = None
 INACTIVITY_THRESHOLD = 21600  # 6 hours in seconds
 MAX_MESSAGE_LENGTH = 4096  # Telegram's max message length
-FORWARD_DELAY = 1  # seconds delay between forwarding messages
+FORWARD_DELAY = 10  # seconds delay between forwarding messages
 QUEUE_INACTIVITY_THRESHOLD = 600  # 10 minutes in seconds for queue inactivity alert
 NUM_WORKERS = 3  # Number of async workers for queue processing
+
+# Lock for synchronizing message queue processing
+queue_lock = asyncio.Lock()
 
 # Logging setup
 logging.basicConfig(
@@ -160,36 +163,46 @@ def apply_custom_header_footer(text, custom_header, custom_footer):
 async def send_split_message(client, entity, message_text, reply_to=None, silent=False, entities=None):
     """Send long messages by splitting them into parts."""
     if len(message_text) <= MAX_MESSAGE_LENGTH:
-        return await client.send_message(
-            entity=entity,
-            message=message_text,
-            reply_to=reply_to,
-            silent=silent,
-            formatting_entities=entities if entities else None
-        )
+        try:
+            return await client.send_message(
+                entity=entity,
+                message=message_text,
+                reply_to=reply_to,
+                silent=silent,
+                formatting_entities=entities if entities else None
+            )
+        except Exception as e:
+            logger.error(f"Failed to send message to {entity}: {e}")
+            return None
     parts = [message_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(message_text), MAX_MESSAGE_LENGTH)]
     sent_messages = []
     for part in parts:
-        sent_msg = await client.send_message(
-            entity=entity,
-            message=part,
-            reply_to=reply_to if not sent_messages else None,
-            silent=silent,
-            formatting_entities=entities if entities and not sent_messages else None
-        )
-        sent_messages.append(sent_msg)
-        await asyncio.sleep(0.5)
+        try:
+            sent_msg = await client.send_message(
+                entity=entity,
+                message=part,
+                reply_to=reply_to if not sent_messages else None,
+                silent=silent,
+                formatting_entities=entities if entities and not sent_messages else None
+            )
+            sent_messages.append(sent_msg)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Failed to send message part to {entity}: {e}")
     return sent_messages[0] if sent_messages else None
 
 async def notify_blocked(event, mapping, pair_name, reason):
     """Notify the owner when a message is blocked."""
     if NOTIFY_CHAT_ID:
         msg_id = getattr(event.message, 'id', 'Unknown')
-        await client.send_message(
-            NOTIFY_CHAT_ID,
-            f"🚫 Message blocked in pair '{pair_name}' from '{mapping['source']}'.\n"
-            f"📄 Reason: {reason}\n🆔 Source Message ID: {msg_id}"
-        )
+        try:
+            await client.send_message(
+                NOTIFY_CHAT_ID,
+                f"🚫 Message blocked in pair '{pair_name}' from '{mapping['source']}'.\n"
+                f"📄 Reason: {reason}\n🆔 Source Message ID: {msg_id}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send blocked notification to {NOTIFY_CHAT_ID}: {e}")
 
 # Watermark Functions
 def get_font_path(font_name):
@@ -330,8 +343,13 @@ def add_watermark(image_data, watermark_config):
 
 # Core Functions
 async def forward_message_with_retry(event, mapping, user_id, pair_name):
-    """Forward a message with retries, filtering, and error handling."""
+    """Forward a message with retries, filtering, and enhanced error handling."""
     source_msg_id = event.message.id if hasattr(event.message, 'id') else "Unknown"
+    # Validate user_id
+    if not isinstance(user_id, str) or not user_id.isdigit():
+        logger.error(f"Invalid user_id '{user_id}' for pair '{pair_name}'. Skipping.")
+        return False
+
     for attempt in range(MAX_RETRIES):
         try:
             start_time = datetime.now()
@@ -429,7 +447,6 @@ async def forward_message_with_retry(event, mapping, user_id, pair_name):
                 elif isinstance(media, MessageMediaPoll):
                     poll = media.poll
                     answers = [PollAnswer(answer.text, answer.option) for answer in poll.answers]
-                    # Warn if it's a quiz, as correct answers cannot be preserved
                     if poll.quiz:
                         logger.warning(f"Forwarding quiz poll for pair '{pair_name}', but correct answers cannot be preserved.")
                         if NOTIFY_CHAT_ID:
@@ -452,7 +469,7 @@ async def forward_message_with_retry(event, mapping, user_id, pair_name):
                                     close_date=poll.close_date,
                                     closed=poll.closed
                                 ),
-                                correct_answers=None  # Cannot preserve correct answers when forwarding
+                                correct_answers=None
                             ),
                             reply_to=reply_to,
                             silent=event.message.silent,
@@ -496,6 +513,10 @@ async def forward_message_with_retry(event, mapping, user_id, pair_name):
                     entities=original_entities
                 )
 
+            if not sent_message:
+                logger.error(f"Failed to forward message for pair '{pair_name}' (Source Msg ID: {source_msg_id}): No message sent")
+                return False
+
             await store_message_mapping(event, mapping, sent_message)
             pair_stats[user_id][pair_name]['forwarded'] += 1
             pair_stats[user_id][pair_name]['last_activity'] = datetime.now().isoformat()
@@ -506,23 +527,30 @@ async def forward_message_with_retry(event, mapping, user_id, pair_name):
             wait_time = e.seconds
             logger.warning(f"Flood wait error, sleeping for {wait_time} seconds for pair '{pair_name}' (Source Msg ID: {source_msg_id})")
             await asyncio.sleep(wait_time)
+        except errors.UserBlockedError as e:
+            logger.error(f"Failed to forward message to {mapping['destination']} for pair '{pair_name}' (Source Msg ID: {source_msg_id}): User blocked bot")
+            mapping['active'] = False
+            save_mappings()
+            if NOTIFY_CHAT_ID:
+                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Disabled pair '{pair_name}' due to user blocking bot")
+            return False
+        except errors.ChatWriteForbiddenError as e:
+            logger.error(f"Failed to forward message to {mapping['destination']} for pair '{pair_name}' (Source Msg ID: {source_msg_id}): Bot forbidden to write")
+            mapping['active'] = False
+            save_mappings()
+            if NOTIFY_CHAT_ID:
+                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Disabled pair '{pair_name}' due to write permission error")
+            return False
+        except errors.ChannelInvalidError as e:
+            logger.error(f"Failed to forward message to {mapping['destination']} for pair '{pair_name}' (Source Msg ID: {source_msg_id}): Invalid channel")
+            mapping['active'] = False
+            save_mappings()
+            if NOTIFY_CHAT_ID:
+                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Disabled pair '{pair_name}' due to invalid channel")
+            return False
         except errors.PollOptionInvalidError as e:
             logger.error(f"Poll option error for pair '{pair_name}' (Source Msg ID: {source_msg_id}): {e}")
             await notify_blocked(event, mapping, pair_name, f"Invalid poll options: {e}")
-            return False
-        except errors.ChatWriteForbiddenError as e:
-            logger.warning(f"Bot forbidden to write in {mapping['destination']}. Disabling pair '{pair_name}'.")
-            mapping['active'] = False
-            save_mappings()
-            if NOTIFY_CHAT_ID:
-                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Disabled pair '{pair_name}' due to write permission error.")
-            return False
-        except errors.ChannelInvalidError as e:
-            logger.warning(f"Invalid channel {mapping['destination']}. Disabling pair '{pair_name}'.")
-            mapping['active'] = False
-            save_mappings()
-            if NOTIFY_CHAT_ID:
-                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Disabled pair '{pair_name}' due to invalid channel.")
             return False
         except (errors.RPCError, ConnectionError) as e:
             logger.warning(f"Attempt {attempt + 1} failed for pair '{pair_name}' (Source Msg ID: {source_msg_id}): {e}")
@@ -531,21 +559,23 @@ async def forward_message_with_retry(event, mapping, user_id, pair_name):
                 logger.info(f"Retrying in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
             else:
-                error_msg = f"❌ Failed to forward message for pair '{pair_name}' (Source Msg ID: {source_msg_id}) after {MAX_RETRIES} attempts. Error: {e}"
-                logger.error(error_msg)
+                logger.error(f"Failed to forward message for pair '{pair_name}' (Source Msg ID: {source_msg_id}) after {MAX_RETRIES} attempts: {e}")
                 if NOTIFY_CHAT_ID:
-                    await client.send_message(NOTIFY_CHAT_ID, error_msg)
+                    await client.send_message(NOTIFY_CHAT_ID, f"❌ Failed to forward message for pair '{pair_name}' (Source Msg ID: {source_msg_id}) after {MAX_RETRIES} attempts: {e}")
                 return False
         except Exception as e:
-            error_msg = f"⚠️ Unexpected error forwarding message for pair '{pair_name}' (Source Msg ID: {source_msg_id}): {e}"
-            logger.error(error_msg, exc_info=True)
+            logger.error(f"Unexpected error forwarding message for pair '{pair_name}' (Source Msg ID: {source_msg_id}): {e}", exc_info=True)
             if NOTIFY_CHAT_ID:
-                await client.send_message(NOTIFY_CHAT_ID, error_msg)
+                await client.send_message(NOTIFY_CHAT_ID, f"⚠️ Unexpected error forwarding message for pair '{pair_name}' (Source Msg ID: {source_msg_id}): {e}")
             return False
 
 async def edit_forwarded_message(event, mapping, user_id, pair_name):
     """Edit a forwarded message when the source message is edited."""
     try:
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            logger.error(f"Invalid user_id '{user_id}' for pair '{pair_name}'. Skipping edit.")
+            return
+
         if not hasattr(client, 'forwarded_messages'):
             client.forwarded_messages = {}
             logger.info("Initialized missing forwarded_messages attribute.")
@@ -669,6 +699,10 @@ async def edit_forwarded_message(event, mapping, user_id, pair_name):
 async def delete_forwarded_message(event, mapping, user_id, pair_name):
     """Delete a forwarded message when the source message is deleted."""
     try:
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            logger.error(f"Invalid user_id '{user_id}' for pair '{pair_name}'. Skipping deletion.")
+            return
+
         if not hasattr(client, 'forwarded_messages'):
             client.forwarded_messages = {}
             logger.info("Initialized missing forwarded_messages attribute.")
@@ -1360,6 +1394,10 @@ async def forward_messages(event):
     """Handle new messages and queue them for forwarding."""
     queued_time = datetime.now()
     for user_id, pairs in channel_mappings.items():
+        # Validate user_id
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            logger.error(f"Invalid user_id '{user_id}' in channel_mappings. Skipping.")
+            continue
         for pair_name, mapping in pairs.items():
             if mapping['active'] and event.chat_id == int(mapping['source']):
                 message_queue.append((event, mapping, user_id, pair_name, queued_time))
@@ -1373,6 +1411,10 @@ async def handle_message_edit(event):
     if not is_connected:
         return
     for user_id, pairs in channel_mappings.items():
+        # Validate user_id
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            logger.error(f"Invalid user_id '{user_id}' in channel_mappings. Skipping edit.")
+            continue
         for pair_name, mapping in pairs.items():
             if mapping['active'] and event.chat_id == int(mapping['source']):
                 try:
@@ -1387,6 +1429,10 @@ async def handle_message_deleted(event):
     if not is_connected:
         return
     for user_id, pairs in channel_mappings.items():
+        # Validate user_id
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            logger.error(f"Invalid user_id '{user_id}' in channel_mappings. Skipping deletion.")
+            continue
         for pair_name, mapping in pairs.items():
             if mapping['active'] and event.chat_id == int(mapping['source']):
                 try:
@@ -1412,15 +1458,19 @@ async def check_connection_status():
         await asyncio.sleep(5)
 
 async def queue_worker():
-    """Process messages from the queue concurrently."""
+    """Process messages from the queue concurrently with a lock."""
     while True:
         if is_connected and message_queue:
-            try:
-                event, mapping, user_id, pair_name, queued_time = message_queue.popleft()
-                await forward_message_with_retry(event, mapping, user_id, pair_name)
-                await asyncio.sleep(FORWARD_DELAY)
-            except Exception as e:
-                logger.error(f"Worker error: {e}")
+            async with queue_lock:
+                try:
+                    event, mapping, user_id, pair_name, queued_time = message_queue.popleft()
+                    logger.info(f"Processing message for pair '{pair_name}' (Source Msg ID: {event.message.id})")
+                    await forward_message_with_retry(event, mapping, user_id, pair_name)
+                    logger.info(f"Starting {FORWARD_DELAY}s delay for pair '{pair_name}'")
+                    await asyncio.sleep(FORWARD_DELAY)
+                    logger.info(f"Completed {FORWARD_DELAY}s delay for pair '{pair_name}'")
+                except Exception as e:
+                    logger.error(f"Worker error: {e}")
         else:
             await asyncio.sleep(1)
 
@@ -1452,6 +1502,9 @@ async def check_pair_inactivity():
             continue
         current_time = datetime.now()
         for user_id, pairs in channel_mappings.items():
+            if not isinstance(user_id, str) or not user_id.isdigit():
+                logger.error(f"Invalid user_id '{user_id}' in channel_mappings. Skipping inactivity check.")
+                continue
             for pair_name, mapping in pairs.items():
                 if not mapping['active']:
                     continue
@@ -1475,6 +1528,9 @@ async def send_periodic_report():
         if not is_connected or not MONITOR_CHAT_ID:
             continue
         for user_id in channel_mappings:
+            if not isinstance(user_id, str) or not user_id.isdigit():
+                logger.error(f"Invalid user_id '{user_id}' in channel_mappings. Skipping report.")
+                continue
             header = "📊 6-Hour Report\n--------------------\n"
             report = []
             total_queued = len(message_queue)
@@ -1486,62 +1542,4 @@ async def send_periodic_report():
                     f"📌 {pair_name}\n"
                     f"   ➡️ Route: {data['source']} → {data['destination']}\n"
                     f"   ✅ Status: {'Active' if data['active'] else 'Paused'}\n"
-                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']}\n"
-                    f"   🚫 Blk: {stats['blocked']} | 📥 Que: {stats['queued']}\n"
-                    f"---------------"
-                )
-            full_message = header + "\n".join(report) + f"\n📥 Queued: {total_queued}"
-            try:
-                await client.send_message(MONITOR_CHAT_ID, full_message)
-                logger.info("Sent periodic report")
-            except Exception as e:
-                logger.error(f"Error sending report: {e}")
-
-# Main Function
-async def main():
-    """Start the bot and manage periodic tasks."""
-    load_mappings()
-    tasks = [
-        check_connection_status(),
-        send_periodic_report(),
-        check_pair_inactivity(),
-        check_queue_inactivity()
-    ]
-    for _ in range(NUM_WORKERS):
-        tasks.append(queue_worker())
-    for task in tasks:
-        asyncio.create_task(task)
-    logger.info("🤖 Bot is starting...")
-
-    try:
-        await client.start()
-        if not await client.is_user_authorized():
-            phone = input("Please enter your phone (or bot token): ")
-            await client.start(phone=phone)
-            code = input("Please enter the verification code you received: ")
-            await client.sign_in(phone=phone, code=code)
-
-        global is_connected, MONITOR_CHAT_ID, NOTIFY_CHAT_ID
-        is_connected = client.is_connected()
-        MONITOR_CHAT_ID = (await client.get_me()).id
-        NOTIFY_CHAT_ID = MONITOR_CHAT_ID
-
-        if is_connected:
-            logger.info("📡 Initial connection established")
-        else:
-            logger.warning("📡 Initial connection not established")
-
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
-    finally:
-        logger.info("🤖 Bot is shutting down...")
-        save_mappings()
-
-if __name__ == "__main__":
-    try:
-        client.loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        logger.info("🤖 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']}\n
