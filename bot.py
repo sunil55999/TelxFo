@@ -1239,7 +1239,7 @@ async def toggle_watermark(event):
             'font': 'arial',
             'font_size': 36,
             'color': 'white',
-            'opacity': 0.7,
+            'opacity': 0.7
         }
 
     current = channel_mappings[user_id][pair_name]['watermark']['enabled']
@@ -1265,7 +1265,7 @@ async def set_watermark_text(event):
             'font': 'arial',
             'font_size': 36,
             'color': 'white',
-            'opacity': 0.7,
+            'opacity': 0.7
         }
     else:
         channel_mappings[user_id][pair_name]['watermark']['text'] = text
@@ -1291,7 +1291,7 @@ async def set_watermark_position(event):
             'font': 'arial',
             'font_size': 36,
             'color': 'white',
-            'opacity': 0.7,
+            'opacity': 0.7
         }
     else:
         channel_mappings[user_id][pair_name]['watermark']['position'] = position
@@ -1318,7 +1318,7 @@ async def set_watermark_font(event):
             'font': font,
             'font_size': size,
             'color': 'white',
-            'opacity': 0.7,
+            'opacity': 0.7
         }
     else:
         channel_mappings[user_id][pair_name]['watermark']['font'] = font
@@ -1346,7 +1346,7 @@ async def set_watermark_color(event):
             'font': 'arial',
             'font_size': 36,
             'color': color,
-            'opacity': opacity,
+            'opacity': opacity
         }
     else:
         channel_mappings[user_id][pair_name]['watermark']['color'] = color
@@ -1372,7 +1372,7 @@ async def watermark_info(event):
             'font': 'arial',
             'font_size': 36,
             'color': 'white',
-            'opacity': 0.7,
+            'opacity': 0.7
         }
         save_mappings()
 
@@ -1458,7 +1458,7 @@ async def check_connection_status():
         await asyncio.sleep(5)
 
 async def queue_worker():
-    """Process messages from the queue concurrently with a lock."""
+    """Process messages from the queue with a consistent delay."""
     while True:
         if is_connected and message_queue:
             async with queue_lock:
@@ -1466,11 +1466,12 @@ async def queue_worker():
                     event, mapping, user_id, pair_name, queued_time = message_queue.popleft()
                     logger.info(f"Processing message for pair '{pair_name}' (Source Msg ID: {event.message.id})")
                     await forward_message_with_retry(event, mapping, user_id, pair_name)
+                except Exception as e:
+                    logger.error(f"Worker error: {e}")
+                finally:
                     logger.info(f"Starting {FORWARD_DELAY}s delay for pair '{pair_name}'")
                     await asyncio.sleep(FORWARD_DELAY)
                     logger.info(f"Completed {FORWARD_DELAY}s delay for pair '{pair_name}'")
-                except Exception as e:
-                    logger.error(f"Worker error: {e}")
         else:
             await asyncio.sleep(1)
 
@@ -1538,36 +1539,31 @@ async def send_periodic_report():
                 stats = pair_stats.get(user_id, {}).get(pair_name, {
                     'forwarded': 0, 'edited': 0, 'deleted': 0, 'blocked': 0, 'queued': 0, 'last_activity': None
                 })
-                last_activity = stats['last_activity'] or 'N/A'
-                if len(last_activity) > 20:
-                    last_activity = last_activity[:17] + "..."
                 report.append(
                     f"📌 {pair_name}\n"
                     f"   ➡️ Route: {data['source']} → {data['destination']}\n"
                     f"   ✅ Status: {'Active' if data['active'] else 'Paused'}\n"
-                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']} | Blk: {stats['blocked']} | Que: {stats['queued']}\n"
-                    f"   ⏰ Last: {last_activity}\n"
-                    f"---------------"
+                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']}\n"
+                    f"   🚫 Blk: {stats['blocked']} | 📥 Que: {stats['queued']}\n"
+                    f"   ⏰ Last: {stats['last_activity'] or 'N/A'}"
                 )
-            footer = f"\n--------------------\n📥 Total Queued: {total_queued}"
-            full_message = header + "\n".join(report) + footer
+            full_message = header + "\n".join(report) + f"\n--------------------\n📥 Total Queued: {total_queued}"
             await client.send_message(MONITOR_CHAT_ID, full_message)
 
-# Main Function
 async def main():
-    """Start the bot and run periodic tasks."""
+    """Start the bot and all background tasks."""
     load_mappings()
     await client.start()
-    logger.info("Bot started")
+    logger.info("Client started.")
     tasks = [
-        check_connection_status(),
-        check_queue_inactivity(),
-        check_pair_inactivity(),
-        send_periodic_report()
+        asyncio.create_task(check_connection_status()),
+        asyncio.create_task(check_queue_inactivity()),
+        asyncio.create_task(check_pair_inactivity()),
+        asyncio.create_task(send_periodic_report())
     ]
     for _ in range(NUM_WORKERS):
-        tasks.append(queue_worker())
+        tasks.append(asyncio.create_task(queue_worker()))
     await asyncio.gather(*tasks)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
