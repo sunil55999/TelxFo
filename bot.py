@@ -1538,8 +1538,36 @@ async def send_periodic_report():
                 stats = pair_stats.get(user_id, {}).get(pair_name, {
                     'forwarded': 0, 'edited': 0, 'deleted': 0, 'blocked': 0, 'queued': 0, 'last_activity': None
                 })
+                last_activity = stats['last_activity'] or 'N/A'
+                if len(last_activity) > 20:
+                    last_activity = last_activity[:17] + "..."
                 report.append(
                     f"📌 {pair_name}\n"
                     f"   ➡️ Route: {data['source']} → {data['destination']}\n"
                     f"   ✅ Status: {'Active' if data['active'] else 'Paused'}\n"
-                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']}\n
+                    f"   📈 Fwd: {stats['forwarded']} | Edt: {stats['edited']} | Del: {stats['deleted']} | Blk: {stats['blocked']} | Que: {stats['queued']}\n"
+                    f"   ⏰ Last: {last_activity}\n"
+                    f"---------------"
+                )
+            footer = f"\n--------------------\n📥 Total Queued: {total_queued}"
+            full_message = header + "\n".join(report) + footer
+            await client.send_message(MONITOR_CHAT_ID, full_message)
+
+# Main Function
+async def main():
+    """Start the bot and run periodic tasks."""
+    load_mappings()
+    await client.start()
+    logger.info("Bot started")
+    tasks = [
+        check_connection_status(),
+        check_queue_inactivity(),
+        check_pair_inactivity(),
+        send_periodic_report()
+    ]
+    for _ in range(NUM_WORKERS):
+        tasks.append(queue_worker())
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    asyncio.run(main())
