@@ -728,9 +728,9 @@ async def store_message_mapping(event, mapping, sent_message):
         logger.error(f"Error storing message mapping: {e}")
 
 # Event Handlers
-@client.on(events.NewMessage(pattern='(?i)^/start$'))
+@client.on(events.NewMessage(pattern='(?i)^/sx$'))
 async def start(event):
-    """Handle the /start command."""
+    """Handle the /sx command."""
     await event.reply("✅ ForwardBot Running!\nUse `/commands` for options.")
 
 @client.on(events.NewMessage(pattern='(?i)^/commands$'))
